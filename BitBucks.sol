@@ -1,133 +1,283 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+contract TestBucks11 is ERC20, Pausable {
+    AggregatorV3Interface public priceFeed;
+    address public admin;
+    IERC20 public usdt;
+    // Minimum deposit amount for USDT
+    uint256 public minDepositAmount;
+    // Timestamp for the last time the minimum deposit amount was updated
+    uint256 public lastUpdateTimestamp;
 
-contract BitBucks is ChainlinkClient, ERC20 {
-    using SafeERC20 for ERC20;
-    using EnumerableSet for EnumerableSet.Bytes32Set;
 
-    address public btcDepositAddress;  // BTC deposit address
-    uint256 public constant VESTING_PERIOD = 1156 days;  // Vesting period for user tokens
-    uint256 private oraclePayment = 0.1 * 10**18;  // Payment for Chainlink oracle (adjust LINK payment)
-    bytes32 public currentRequestId;
-    EnumerableSet.Bytes32Set private trxHashes;  // Track trxhash to prevent reuse
+    // Constants for vesting periods in seconds (for testing)
+    uint256 private constant TOTAL_SECONDS = 1156; // Total vesting period in seconds
+    uint256 private constant VESTING_INTERVAL_SECONDS = 34; // Vesting interval in seconds
+    uint256 private constant RELEASE_PERIODS = TOTAL_SECONDS / VESTING_INTERVAL_SECONDS;
 
-    struct Vesting {
+    // Maximum supply for the token
+    uint256 private constant MAX_SUPPLY = 21_000_000 * (10 ** 18); // 21 million tokens with 18 decimals
+
+    struct VestingSchedule {
         uint256 totalAmount;
+        uint256 amountClaimed;
         uint256 startTime;
-        uint256 claimedAmount;
     }
 
-    mapping(address => Vesting) public userVesting;  // Vesting schedule for users
-    mapping(address => Vesting) public teamVesting;  // Vesting schedule for team tokens
-    mapping(bytes32 => address) public requestToUser; // Mapping requestId to user
-
-    // Team vesting parameters
-    uint256 public liquidityTokens = 1944 * 10**18;  // 1,944 tokens per month for liquidity
-    uint256 public legalTokens = 556 * 10**18;       // 556 tokens quarterly for legal work
-    uint256 public developmentTokens = 833 * 10**18; // 833 tokens per month for development
-    uint256 public treasuryTokens = 278 * 10**18;    // 278 tokens every 6 months for treasury
-    uint256 public stakingTokens = 1944 * 10**18;    // 1,944 tokens per month for staking fund
-
-    event RequestBTCValidation(bytes32 indexed requestId, bool validated, uint256 btcAmount);
-    event TeamTokensVested(address indexed teamWallet, uint256 amount, string category);
-
-    constructor(
-        address _linkToken,
-        address _oracle,
-        address _btcDepositAddress
-    ) ERC20("BitBucks", "BUK") {
-        setChainlinkToken(_linkToken);
-        setChainlinkOracle(_oracle);
-        btcDepositAddress = _btcDepositAddress;
-
-        // Initialize team vesting schedules
-        initializeTeamVesting();
+    struct TeamVestingSchedule {
+        uint256 totalAmount;
+        uint256 amountClaimed;
+        uint256 releaseInterval;
+        uint256 startTime;
+        uint256 duration;
     }
 
-    // User deposits BTC and triggers Chainlink oracle for validation
-    function depositBTC(bytes32 trxhash, uint256 btcAmount) external {
-        require(!trxHashes.contains(trxhash), "Transaction hash already used");
-        trxHashes.add(trxhash);
+    mapping(address => VestingSchedule[]) public vestingSchedules;
+    mapping(address => TeamVestingSchedule[]) public teamVestingSchedules;
 
-        // Initiate Chainlink request to validate BTC deposit
-        Chainlink.Request memory req = buildChainlinkRequest(
-            "job-spec-id", 
-            address(this),
-            this.fulfillBTCValidation.selector
-        );
-        req.addBytes32("trxhash", trxhash);
-        req.add("expectedAddress", btcDepositAddress);
-        req.addUint("expectedAmount", btcAmount);
-        currentRequestId = sendChainlinkRequest(req, oraclePayment);
-        requestToUser[currentRequestId] = msg.sender;  // Map request ID to the user
+    // Events
+    event BuksIssued(address indexed user, uint256 usdtAmount, uint256 btcAmount, uint256 bukAmount);
+    event TokensClaimed(address indexed user, uint256 amount);
+    event ReferralBonus(address indexed referrer, uint256 bonusAmount);
+        event PriceFeedUpdated(address indexed oldPriceFeed, address indexed newPriceFeed);
+
+    // Hardcoded wallet addresses for team vesting
+    address public constant LIQUIDITY_WALLET = 0x90f727dDd8798c7c5711ef6eab9E539acd1c8f3b; // Replace with actual wallet
+    address public constant LEGAL_WALLET = 0x0C6df3cc2e67e2522c14E025fa22Db301C6689F9; // Replace with actual wallet
+    address public constant DEVELOPMENT_WALLET = 0x0C6df3cc2e67e2522c14E025fa22Db301C6689F9; // Replace with actual wallet
+    address public constant TREASURY_WALLET = 0x0C6df3cc2e67e2522c14E025fa22Db301C6689F9; // Replace with actual wallet
+    address public constant STAKING_WALLET = 0x0C6df3cc2e67e2522c14E025fa22Db301C6689F9; // Replace with actual wallet
+
+
+    constructor(address _priceFeed, address _admin, address _usdt, uint256 _minDepositAmount) ERC20("BUKs", "BUKs") {
+        require(_admin != address(0), "Invalid admin address");
+        require(_priceFeed != address(0), "Invalid price feed address");
+        require(_usdt != address(0), "Invalid USDT address");
+
+        priceFeed = AggregatorV3Interface(_priceFeed);
+        admin = _admin;
+        usdt = IERC20(_usdt);
+        minDepositAmount = _minDepositAmount; // Set minimum deposit amount
+
+        _initializeTeamVesting();
+
+
+teamVestingSchedules[LIQUIDITY_WALLET].push(TeamVestingSchedule(30.5 * (10 ** 18), 0, 30, block.timestamp, 4 * 365 * 24 * 60 * 60)); // Liquidity
+teamVestingSchedules[LEGAL_WALLET].push(TeamVestingSchedule(27.8 * (10 ** 18), 0, 90, block.timestamp, 4 * 365 * 24 * 60 * 60)); // Legal
+teamVestingSchedules[DEVELOPMENT_WALLET].push(TeamVestingSchedule(17.3 * (10 ** 18), 0, 30, block.timestamp, 4 * 365 * 24 * 60 * 60)); // Development
+teamVestingSchedules[TREASURY_WALLET].push(TeamVestingSchedule(5.7 * (10 ** 18), 0, 180, block.timestamp, 4 * 365 * 24 * 60 * 60)); // Treasury
+teamVestingSchedules[STAKING_WALLET].push(TeamVestingSchedule(43.33 * (10 ** 18), 0, 30, block.timestamp, 5 * 365 * 24 * 60 * 60)); // Staking
     }
 
-    // Callback function from Chainlink Oracle for BTC validation
-    function fulfillBTCValidation(bytes32 _requestId, bool _validated, uint256 btcAmount) public recordChainlinkFulfillment(_requestId) {
-        require(_validated, "BTC deposit validation failed");
 
-        address user = requestToUser[_requestId];
-        uint256 bukAmount = btcAmount * 2;  // Mint twice the BTC amount in BUK tokens
-        _mint(user, bukAmount);
 
-        // Start vesting schedule for the user
-        userVesting[user] = Vesting(bukAmount, block.timestamp, 0);
 
-        emit RequestBTCValidation(_requestId, _validated, btcAmount);
+    function _initializeTeamVesting() internal {
+        // Liquidity vesting: 30.5 tokens per month for 4 years
+        teamVestingSchedules[LIQUIDITY_WALLET].push(TeamVestingSchedule({
+            totalAmount: 30.5 * 12 * 4 * (10 ** 18),
+            amountClaimed: 0,
+            releaseInterval: 30 days,
+            startTime: block.timestamp,
+            duration: 4 * 365 days
+        }));
+
+        // Legal vesting: 27.8 tokens quarterly for 4 years
+        teamVestingSchedules[LEGAL_WALLET].push(TeamVestingSchedule({
+            totalAmount: 27.8 * 4 * 4 * (10 ** 18),
+            amountClaimed: 0,
+            releaseInterval: 90 days,
+            startTime: block.timestamp,
+            duration: 4 * 365 days
+        }));
+
+        // Development vesting: 17.3 tokens per month for 4 years
+        teamVestingSchedules[DEVELOPMENT_WALLET].push(TeamVestingSchedule({
+            totalAmount: 17.3 * 12 * 4 * (10 ** 18),
+            amountClaimed: 0,
+            releaseInterval: 30 days,
+            startTime: block.timestamp,
+            duration: 4 * 365 days
+        }));
+
+        // Treasury vesting: 5.7 tokens every 6 months for 4 years
+        teamVestingSchedules[TREASURY_WALLET].push(TeamVestingSchedule({
+            totalAmount: 5.7 * 2 * 4 * (10 ** 18),
+            amountClaimed: 0,
+            releaseInterval: 180 days,
+            startTime: block.timestamp,
+            duration: 4 * 365 days
+        }));
+
+        // Staking vesting: 43.33 tokens per month for 5 years
+        teamVestingSchedules[STAKING_WALLET].push(TeamVestingSchedule({
+            totalAmount: 43.33 * 12 * 5 * (10 ** 18),
+            amountClaimed: 0,
+            releaseInterval: 30 days,
+            startTime: block.timestamp,
+            duration: 5 * 365 days
+        }));
     }
 
-    // Claim vested tokens (monthly claim for user)
-    function claimVestedTokens() external {
-        Vesting storage vesting = userVesting[msg.sender];
-        require(block.timestamp >= vesting.startTime, "Vesting not started yet");
-        uint256 monthsPassed = (block.timestamp - vesting.startTime) / 30 days;
-        uint256 claimable = (vesting.totalAmount * monthsPassed) / (VESTING_PERIOD / 30 days);
-        uint256 toClaim = claimable - vesting.claimedAmount;
+        // Function to allow admin to update the price feed address
+    function updatePriceFeed(address _newPriceFeed) external onlyAdmin {
+        require(_newPriceFeed != address(0), "Invalid price feed address");
+        address oldPriceFeed = address(priceFeed);
+        priceFeed = AggregatorV3Interface(_newPriceFeed);
 
-        require(toClaim > 0, "No tokens available for claim");
-
-        vesting.claimedAmount += toClaim;
-        _transfer(address(this), msg.sender, toClaim);  // Transfer vested tokens to user
+        emit PriceFeedUpdated(oldPriceFeed, _newPriceFeed);
     }
 
-    // Vest team tokens for the liquidity, legal, development, treasury, and staking wallets
-    function vestTeamTokens(address teamWallet, uint256 amount, string memory category) internal {
-        require(teamWallet != address(0), "Invalid team wallet address");
-        _mint(teamWallet, amount);
-        emit TeamTokensVested(teamWallet, amount, category);
+    function getBitcoinPrice() public view returns (int256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        return price;
+    }
+    function setMinDepositAmount(uint256 _minDepositAmount) external onlyAdmin {
+        // Allow admin to set a new minimum deposit amount only every 4 months
+        require(block.timestamp >= lastUpdateTimestamp + 4 * 30 days, "Can only update every 4 months");
+        minDepositAmount = _minDepositAmount;
+        lastUpdateTimestamp = block.timestamp;
     }
 
-    // Initialize team vesting schedule for the next vesting period
-    function initializeTeamVesting() internal {
-        // Liquidity Vesting (Monthly for 2 years)
-        vestTeamTokens(0xLiquidityWallet, liquidityTokens, "Liquidity");
-        
-        // Legal Work Vesting (Quarterly for 3 years)
-        vestTeamTokens(0xLegalWallet, legalTokens, "Legal");
 
-        // Development Vesting (Monthly for 5 years)
-        vestTeamTokens(0xDevelopmentWallet, developmentTokens, "Development");
+ function depositUSDT(uint256 _usdtAmount, address referrer) external whenNotPaused {
+        require(_usdtAmount >= minDepositAmount, "Amount below minimum deposit");
+        require(usdt.transferFrom(msg.sender, address(this), _usdtAmount), "USDT transfer failed");
 
-        // Treasury Vesting (Every 6 months for 5 years)
-        vestTeamTokens(0xTreasuryWallet, treasuryTokens, "Treasury");
+        int256 btcPriceInUSD = getBitcoinPrice();
+        require(btcPriceInUSD > 0, "Invalid BTC price");
 
-        // Staking Fund Vesting (Monthly for 2 years)
-        vestTeamTokens(0xStakingWallet, stakingTokens, "Staking Fund");
+        uint256 btcAmount = (_usdtAmount * 10**8) / uint256(btcPriceInUSD);
+        uint256 bukAmount = btcAmount * 2;
+
+        // Check if minting would exceed the max supply
+        require(totalSupply() + bukAmount <= MAX_SUPPLY, "Max supply exceeded");
+
+        VestingSchedule memory schedule = VestingSchedule({
+            totalAmount: bukAmount,
+            amountClaimed: 0,
+            startTime: block.timestamp
+        });
+        vestingSchedules[msg.sender].push(schedule);
+
+        emit BuksIssued(msg.sender, _usdtAmount, btcAmount, bukAmount);
+
+        // Issue 5% referral bonus to the referrer if provided
+        if (referrer != address(0)) {
+            uint256 bonusAmount = (bukAmount * 5) / 100;
+            vestingSchedules[referrer].push(VestingSchedule({
+                totalAmount: bonusAmount,
+                amountClaimed: 0,
+                startTime: block.timestamp
+            }));
+            emit ReferralBonus(referrer, bonusAmount);
+        }
     }
 
-    // Set up LINK payment for oracle job
-    function setOraclePayment(uint256 _oraclePayment) external {
-        oraclePayment = _oraclePayment;
+    function calculateVestedAmount(VestingSchedule memory schedule) internal view returns (uint256) {
+        uint256 elapsedTime = block.timestamp - schedule.startTime;
+        uint256 periodsElapsed = elapsedTime / VESTING_INTERVAL_SECONDS;
+
+        if (periodsElapsed > RELEASE_PERIODS) {
+            periodsElapsed = RELEASE_PERIODS;
+        }
+
+        return (schedule.totalAmount * periodsElapsed) / RELEASE_PERIODS;
     }
 
-    // Withdraw LINK tokens from the contract (if needed)
-    function withdrawLink() external {
-        LinkTokenInterface link = LinkTokenInterface(chainlinkTokenAddress());
-        require(link.transfer(msg.sender, link.balanceOf(address(this))), "Unable to transfer");
+function claimTokens() external whenNotPaused {
+    uint256 totalClaimable = 0;
+    uint256 maxAvailableToMint = MAX_SUPPLY - totalSupply();
+
+    for (uint256 i = 0; i < vestingSchedules[msg.sender].length; i++) {
+        VestingSchedule storage schedule = vestingSchedules[msg.sender][i];
+        uint256 vested = calculateVestedAmount(schedule);
+        uint256 claimable = vested - schedule.amountClaimed;
+
+        if (claimable > 0) {
+            // Adjust claimable to max available if it exceeds remaining mintable supply
+            if (totalClaimable + claimable > maxAvailableToMint) {
+                claimable = maxAvailableToMint - totalClaimable;
+            }
+
+            schedule.amountClaimed += claimable;
+            totalClaimable += claimable;
+
+            // If the maximum mintable tokens have been reached, exit the loop
+            if (totalClaimable == maxAvailableToMint) {
+                break;
+            }
+        }
+    }
+
+    require(totalClaimable > 0, "No tokens available for claim");
+
+    _mint(msg.sender, totalClaimable);
+    emit TokensClaimed(msg.sender, totalClaimable);
+}
+
+
+   function claimTeamTokens() external whenNotPaused {
+    // Check if the caller's address is one of the team wallets
+    require(
+        msg.sender == LIQUIDITY_WALLET ||
+        msg.sender == LEGAL_WALLET ||
+        msg.sender == DEVELOPMENT_WALLET ||
+        msg.sender == TREASURY_WALLET ||
+        msg.sender == STAKING_WALLET,
+        "Unauthorized: Not a team wallet"
+    );
+
+    TeamVestingSchedule[] storage schedules = teamVestingSchedules[msg.sender];
+    require(schedules.length > 0, "No team vesting schedule");
+
+    uint256 totalClaimable = 0;
+
+    for (uint256 i = 0; i < schedules.length; i++) {
+        TeamVestingSchedule storage schedule = schedules[i];
+
+        uint256 elapsedTime = block.timestamp - schedule.startTime;
+        if (elapsedTime >= schedule.duration) {
+            uint256 remainingAmount = schedule.totalAmount - schedule.amountClaimed;
+            schedule.amountClaimed = schedule.totalAmount;
+            totalClaimable += remainingAmount;
+        } else {
+            uint256 periodsElapsed = elapsedTime / schedule.releaseInterval;
+            uint256 vestedAmount = (schedule.totalAmount * periodsElapsed) / (schedule.duration / schedule.releaseInterval);
+            uint256 claimableAmount = vestedAmount - schedule.amountClaimed;
+            schedule.amountClaimed += claimableAmount;
+            totalClaimable += claimableAmount;
+        }
+    }
+
+    require(totalClaimable > 0, "No tokens available for claim");
+    _mint(msg.sender, totalClaimable);
+    emit TokensClaimed(msg.sender, totalClaimable);
+}
+
+    
+    function withdrawUSDT(uint256 _amount) external onlyAdmin {
+    require(_amount > 0, "Amount must be greater than 0");
+    require(usdt.balanceOf(address(this)) >= _amount, "Insufficient USDT balance");
+    require(usdt.transfer(admin, _amount), "USDT transfer failed");
+}
+
+
+    function pause() external onlyAdmin {
+        _pause();
+    }
+
+    function unpause() external onlyAdmin {
+        _unpause();
+    }
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin can call this function");
+        _;
     }
 }
