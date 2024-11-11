@@ -5,7 +5,11 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 contract TestBucks11 is ERC20, Pausable {
+    using SafeERC20 for IERC20;
+
     AggregatorV3Interface public priceFeed;
     address public admin;
     IERC20 public usdt;
@@ -82,41 +86,41 @@ teamVestingSchedules[STAKING_WALLET].push(TeamVestingSchedule(43.33 * (10 ** 18)
         teamVestingSchedules[LIQUIDITY_WALLET].push(TeamVestingSchedule({
             totalAmount: 30.5 * 12 * 4 * (10 ** 18),
             amountClaimed: 0,
-            releaseInterval: 30 days,
+            releaseInterval: 30 seconds,
             startTime: block.timestamp,
-            duration: 4 * 365 days
+            duration: 4 * 365 seconds
         }));
 
         // Legal vesting: 27.8 tokens quarterly for 4 years
         teamVestingSchedules[LEGAL_WALLET].push(TeamVestingSchedule({
             totalAmount: 27.8 * 4 * 4 * (10 ** 18),
             amountClaimed: 0,
-            releaseInterval: 90 days,
+            releaseInterval: 90 seconds,
             startTime: block.timestamp,
-            duration: 4 * 365 days
+            duration: 4 * 365 seconds
         }));
 
         // Development vesting: 17.3 tokens per month for 4 years
         teamVestingSchedules[DEVELOPMENT_WALLET].push(TeamVestingSchedule({
             totalAmount: 17.3 * 12 * 4 * (10 ** 18),
             amountClaimed: 0,
-            releaseInterval: 30 days,
+            releaseInterval: 30 seconds,
             startTime: block.timestamp,
-            duration: 4 * 365 days
+            duration: 4 * 365 seconds
         }));
 
         // Treasury vesting: 5.7 tokens every 6 months for 4 years
         teamVestingSchedules[TREASURY_WALLET].push(TeamVestingSchedule({
             totalAmount: 5.7 * 2 * 4 * (10 ** 18),
             amountClaimed: 0,
-            releaseInterval: 180 days,
+            releaseInterval: 180 seconds,
             startTime: block.timestamp,
-            duration: 4 * 365 days
+            duration: 4 * 365 seconds
         }));
 
         // Staking vesting: 43.33 tokens per month for 5 years
         teamVestingSchedules[STAKING_WALLET].push(TeamVestingSchedule({
-            totalAmount: 43.33 * 12 * 5 * (10 ** 18),
+            totalAmount: 43.33 * 12 * 5 * (10 ** 1),
             amountClaimed: 0,
             releaseInterval: 30 days,
             startTime: block.timestamp,
@@ -146,39 +150,49 @@ teamVestingSchedules[STAKING_WALLET].push(TeamVestingSchedule(43.33 * (10 ** 18)
 
 
  function depositUSDT(uint256 _usdtAmount, address referrer) external whenNotPaused {
-        require(_usdtAmount >= minDepositAmount, "Amount below minimum deposit");
-        require(usdt.transferFrom(msg.sender, address(this), _usdtAmount), "USDT transfer failed");
+    require(_usdtAmount >= minDepositAmount, "Amount below minimum deposit");
+        usdt.safeTransferFrom(msg.sender, address(this), _usdtAmount);
 
-        int256 btcPriceInUSD = getBitcoinPrice();
-        require(btcPriceInUSD > 0, "Invalid BTC price");
+    // Prevent self-referral
+    require(referrer != msg.sender, "Cannot refer yourself");
 
-        uint256 btcAmount = (_usdtAmount * 10**8) / uint256(btcPriceInUSD);
-        uint256 bukAmount = btcAmount * 2;
+    // Get BTC price in USD (8 decimals)
+    int256 btcPriceInUSD = getBitcoinPrice();
+    require(btcPriceInUSD > 0, "Invalid BTC price");
 
-        // Check if minting would exceed the max supply
-        require(totalSupply() + bukAmount <= MAX_SUPPLY, "Max supply exceeded");
+    // Convert _usdtAmount to 18 decimals (from 6 decimals)
+    uint256 usdtAmountIn18Decimals = _usdtAmount * 10**12;
 
-        VestingSchedule memory schedule = VestingSchedule({
-            totalAmount: bukAmount,
+    // Calculate BTC amount in 18 decimals to match BUK's standard (8 for BTC price, 10 more for decimal alignment)
+    uint256 btcAmount = (usdtAmountIn18Decimals * 10**8) / uint256(btcPriceInUSD);
+
+    // Calculate BUK amount in 18 decimals
+    uint256 bukAmount = btcAmount * 2; 
+
+    // Check if minting would exceed max supply
+    require(totalSupply() + bukAmount <= MAX_SUPPLY, "Max supply exceeded");
+
+    // Create vesting schedule
+    VestingSchedule memory schedule = VestingSchedule({
+        totalAmount: bukAmount,
+        amountClaimed: 0,
+        startTime: block.timestamp
+    });
+    vestingSchedules[msg.sender].push(schedule);
+
+    emit BuksIssued(msg.sender, _usdtAmount, btcAmount, bukAmount);
+
+    // Issue 5% referral bonus to the referrer if provided
+    if (referrer != address(0)) {
+        uint256 bonusAmount = (bukAmount * 5) / 100;
+        vestingSchedules[referrer].push(VestingSchedule({
+            totalAmount: bonusAmount,
             amountClaimed: 0,
             startTime: block.timestamp
-        });
-        vestingSchedules[msg.sender].push(schedule);
-
-        emit BuksIssued(msg.sender, _usdtAmount, btcAmount, bukAmount);
-
-        // Issue 5% referral bonus to the referrer if provided
-        if (referrer != address(0)) {
-            uint256 bonusAmount = (bukAmount * 5) / 100;
-            vestingSchedules[referrer].push(VestingSchedule({
-                totalAmount: bonusAmount,
-                amountClaimed: 0,
-                startTime: block.timestamp
-            }));
-            emit ReferralBonus(referrer, bonusAmount);
-        }
+        }));
+        emit ReferralBonus(referrer, bonusAmount);
     }
-
+}
     function calculateVestedAmount(VestingSchedule memory schedule) internal view returns (uint256) {
         uint256 elapsedTime = block.timestamp - schedule.startTime;
         uint256 periodsElapsed = elapsedTime / VESTING_INTERVAL_SECONDS;
@@ -261,11 +275,13 @@ function claimTokens() external whenNotPaused {
 }
 
     
-    function withdrawUSDT(uint256 _amount) external onlyAdmin {
-    require(_amount > 0, "Amount must be greater than 0");
-    require(usdt.balanceOf(address(this)) >= _amount, "Insufficient USDT balance");
-    require(usdt.transfer(admin, _amount), "USDT transfer failed");
-}
+   function withdrawUSDT(uint256 _amount) external onlyAdmin {
+        require(_amount > 0, "Amount must be greater than 0");
+        require(usdt.balanceOf(address(this)) >= _amount, "Insufficient USDT balance");
+
+        // Use safeTransfer instead of transfer
+        usdt.safeTransfer(admin, _amount);
+    }
 
 
     function pause() external onlyAdmin {
